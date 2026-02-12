@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import tempfile
 
@@ -17,14 +18,24 @@ st.caption("Sube un catálogo en PDF y pregunta por características, diferencia
 
 with st.sidebar:
     st.header("Configuración")
-    groq_api_key = st.text_input("Groq API Key", type="password", help="Obtenla en console.groq.com")
+
+    groq_api_key = st.text_input(
+        "Groq API Key",
+        type="password",
+        help="Obtenla en console.groq.com"
+    )
+    hf_api_key = st.text_input(
+        "Hugging Face API Key",
+        type="password",
+        help="Necesaria para descargar/usar modelos de Hugging Face en algunos entornos."
+    )
 
     st.divider()
     st.header("Catálogo")
     uploaded_pdf = st.file_uploader("Sube el catálogo (PDF)", type="pdf")
 
     st.divider()
-    st.header("Modelo")
+    st.header("Modelo Groq (LLM)")
     id_model = st.selectbox(
         "Modelo Groq",
         ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"],
@@ -33,37 +44,49 @@ with st.sidebar:
     temperature = st.slider("Temperatura", 0.0, 1.0, 0.3, 0.05)
 
     st.divider()
+    st.header("Embeddings (Hugging Face)")
+    emb_model = st.selectbox(
+        "Modelo embeddings",
+        ["BAAI/bge-large-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"],
+        index=0
+    )
+
+    st.divider()
     st.header("RAG")
     k = st.slider("k (chunks recuperados)", 2, 12, 6)
     chunk_size = st.slider("chunk_size", 300, 1400, 700, 50)
     chunk_overlap = st.slider("chunk_overlap", 0, 300, 80, 10)
 
-if not groq_api_key:
-    st.warning("Introduce la Groq API Key para comenzar.")
+# Validación de keys
+if not groq_api_key or not hf_api_key:
+    st.warning("Introduce ambas API Keys (Groq y Hugging Face) en la barra lateral para comenzar.")
     st.stop()
 
 @st.cache_resource
-def load_base_models(groq_key: str, model_name: str, temp: float):
+def load_base_models(groq_key: str, hf_key: str, model_name: str, temp: float, embedding_name: str):
+    # Exporta el token HF para que huggingface / sentence-transformers pueda descargar modelos
+    # (en local suele funcionar sin token, pero en cloud y modelos gated sí lo necesitarás)
+    os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_key
+    os.environ["HF_TOKEN"] = hf_key
+
     llm = ChatGroq(api_key=groq_key, model=model_name, temperature=temp)
+
     embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-large-en-v1.5",
-        model_kwargs={'device': 'cpu'}
+        model_name=embedding_name,
+        model_kwargs={"device": "cpu"}
     )
     return llm, embeddings
 
-llm, embeddings = load_base_models(groq_api_key, id_model, temperature)
+llm, embeddings = load_base_models(groq_api_key, hf_api_key, id_model, temperature, emb_model)
 
 def build_retriever_from_pdf(file, chunk_size: int, chunk_overlap: int, k: int):
-    # guarda el PDF temporalmente
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
         tf.write(file.getbuffer())
         pdf_path = tf.name
 
-    # carga texto del PDF
     loader = PyMuPDFLoader(pdf_path)
-    docs = loader.load()  # lista de Document, con metadata (página, etc.)
+    docs = loader.load()  # Document por página, suele incluir metadata 'page'
 
-    # splitter sobre documentos (mejor que juntar todo, mantiene metadata por página)
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -71,40 +94,53 @@ def build_retriever_from_pdf(file, chunk_size: int, chunk_overlap: int, k: int):
     )
     chunks = splitter.split_documents(docs)
 
-    # índice vectorial
     vs = FAISS.from_documents(chunks, embedding=embeddings)
     return vs.as_retriever(search_kwargs={"k": k})
 
-# estado
+# ---------------- Session State ----------------
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "pdf_fingerprint" not in st.session_state:
+    st.session_state.pdf_fingerprint = None
 
-# procesa PDF
+def fingerprint_file(file) -> str:
+    # fingerprint simple para detectar cambio de PDF
+    return f"{file.name}:{file.size}"
+
+# Si cambia el PDF, reinicia el retriever
+if uploaded_pdf is not None:
+    fp = fingerprint_file(uploaded_pdf)
+    if st.session_state.pdf_fingerprint != fp:
+        st.session_state.pdf_fingerprint = fp
+        st.session_state.retriever = None  # fuerza reindexado
+
+# ---------------- Indexado PDF ----------------
 if uploaded_pdf and st.session_state.retriever is None:
     with st.spinner("Indexando catálogo PDF..."):
         st.session_state.retriever = build_retriever_from_pdf(
-            uploaded_pdf, chunk_size=chunk_size, chunk_overlap=chunk_overlap, k=k
+            uploaded_pdf,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            k=k
         )
     st.success("✅ Catálogo indexado. Ya puedes preguntar.")
 
-# si aún no hay retriever
 if st.session_state.retriever is None:
     st.info("Sube un catálogo PDF para activar el chat.")
     st.stop()
 
-# pinta historial
+# ---------------- Chat UI ----------------
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# prompt del sistema: forzar comparativas y trazabilidad
 system_prompt = (
     "You are a product-catalog assistant.\n"
     "You MUST answer using ONLY the retrieved context.\n"
     "If the context does not contain the needed info, say: 'No lo sé con la información del catálogo.'\n"
     "When comparing products, create a compact comparison (bullet list or small table) with the attributes found.\n"
-    "Always include citations to the pages/chunks using the metadata if available (e.g., page number).\n"
+    "If you cite information, mention the page number when available.\n"
 )
 
 qa_prompt = ChatPromptTemplate.from_messages([
@@ -116,7 +152,6 @@ qa_prompt = ChatPromptTemplate.from_messages([
 ])
 
 def format_docs(docs):
-    # añade página si viene en metadata
     out = []
     for d in docs:
         page = d.metadata.get("page", None)
@@ -126,7 +161,6 @@ def format_docs(docs):
             out.append(d.page_content)
     return "\n\n---\n\n".join(out)
 
-# chain: recupera docs -> formatea contexto -> llm
 chain = (
     {
         "context": st.session_state.retriever | format_docs,
@@ -137,7 +171,6 @@ chain = (
     | StrOutputParser()
 )
 
-# input chat
 if prompt := st.chat_input("Pregunta por productos, características o 'compara A vs B'"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.chat_message("user").write(prompt)
@@ -145,9 +178,6 @@ if prompt := st.chat_input("Pregunta por productos, características o 'compara 
     with st.chat_message("assistant"):
         with st.spinner("Pensando..."):
             response = chain.invoke(prompt)
-
-            # por si el modelo devuelve tags raros de pensamiento
             clean_response = response.split("</think>")[-1].strip() if "</think>" in response else response
-
             st.write(clean_response)
             st.session_state.messages.append({"role": "assistant", "content": clean_response})
