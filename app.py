@@ -11,7 +11,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 
-# ---------------- UI ----------------
+
 st.set_page_config(page_title="Catalog PDF AI", page_icon="🛒", layout="wide")
 st.title("🛒 Catalog PDF AI")
 st.caption("Sube un catálogo en PDF y pregunta por características, diferencias y comparativas.")
@@ -64,8 +64,6 @@ if not groq_api_key or not hf_api_key:
 
 @st.cache_resource
 def load_base_models(groq_key: str, hf_key: str, model_name: str, temp: float, embedding_name: str):
-    # Exporta el token HF para que huggingface / sentence-transformers pueda descargar modelos
-    # (en local suele funcionar sin token, pero en cloud y modelos gated sí lo necesitarás)
     os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_key
     os.environ["HF_TOKEN"] = hf_key
 
@@ -85,7 +83,7 @@ def build_retriever_from_pdf(file, chunk_size: int, chunk_overlap: int, k: int):
         pdf_path = tf.name
 
     loader = PyMuPDFLoader(pdf_path)
-    docs = loader.load()  # Document por página, suele incluir metadata 'page'
+    docs = loader.load() 
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -97,7 +95,7 @@ def build_retriever_from_pdf(file, chunk_size: int, chunk_overlap: int, k: int):
     vs = FAISS.from_documents(chunks, embedding=embeddings)
     return vs.as_retriever(search_kwargs={"k": k})
 
-# ---------------- Session State ----------------
+
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
 if "messages" not in st.session_state:
@@ -106,7 +104,6 @@ if "pdf_fingerprint" not in st.session_state:
     st.session_state.pdf_fingerprint = None
 
 def fingerprint_file(file) -> str:
-    # fingerprint simple para detectar cambio de PDF
     return f"{file.name}:{file.size}"
 
 # Si cambia el PDF, reinicia el retriever
@@ -116,7 +113,7 @@ if uploaded_pdf is not None:
         st.session_state.pdf_fingerprint = fp
         st.session_state.retriever = None  # fuerza reindexado
 
-# ---------------- Indexado PDF ----------------
+
 if uploaded_pdf and st.session_state.retriever is None:
     with st.spinner("Indexando catálogo PDF..."):
         st.session_state.retriever = build_retriever_from_pdf(
@@ -131,7 +128,7 @@ if st.session_state.retriever is None:
     st.info("Sube un catálogo PDF para activar el chat.")
     st.stop()
 
-# ---------------- Chat UI ----------------
+
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
@@ -139,7 +136,7 @@ system_prompt = (
     "You are a product-catalog assistant.\n"
     "You MUST answer using ONLY the retrieved context.\n"
     "If the context does not contain the needed info, say: 'No lo sé con la información del catálogo.'\n"
-    "Create a table or csv with the product information, more specifically with the following columns: Ref and price \n"
+    "Create a table with the product information comparing products in the context.\n"
     "If you cite information, mention the page number when available.\n"
 )
 
